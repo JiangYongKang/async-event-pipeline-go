@@ -1,0 +1,3 @@
+# Local demo data (append-only event log, atomically replaced state, dead letters)
+.demo-data/
+*.tmp
