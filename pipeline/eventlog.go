@@ -206,6 +206,52 @@ func (l *EventLog) NextOffset() int64 {
 	return l.next
 }
 
+// PublishedKeys 返回当前日志中 [from, end) 区间每条事件的业务键切片
+// （下标即偏移-from，含重复投递副本）。供进度说明逐键统计发布量。
+func (l *EventLog) PublishedKeys(from int64) ([]string, error) {
+	l.mu.RLock()
+	end := l.next
+	starts := append([]int64(nil), l.starts...)
+	f := l.f
+	l.mu.RUnlock()
+	if from < 0 {
+		from = 0
+	}
+	if from > end {
+		return nil, fmt.Errorf("%w: published keys from=%d next=%d", ErrOffsetBeyondEnd, from, end)
+	}
+	out := make([]string, 0, end-from)
+	for pos := from; pos < end; pos++ {
+		if int(pos) >= len(starts) {
+			return nil, fmt.Errorf("%w: missing frame index at offset=%d", ErrLogCorrupt, pos)
+		}
+		key, err := readKeyAt(f, starts[pos])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, key)
+	}
+	return out, nil
+}
+
+// readKeyAt 只解析一帧的 JSON 负载以取出 Key，避免构造完整 StoredEvent。
+func readKeyAt(f *os.File, start int64) (string, error) {
+	hdrBuf := make([]byte, frameHeaderLen)
+	if _, err := io.ReadFull(io.NewSectionReader(f, start, frameHeaderLen), hdrBuf); err != nil {
+		return "", fmt.Errorf("pipeline: read header: %w", err)
+	}
+	n := int(binary.BigEndian.Uint32(hdrBuf[20:24]))
+	body := make([]byte, n)
+	if _, err := io.ReadFull(io.NewSectionReader(f, start+frameHeaderLen, int64(n)), body); err != nil {
+		return "", fmt.Errorf("pipeline: read payload: %w", err)
+	}
+	var ev Event
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return "", fmt.Errorf("%w: bad event json: %v", ErrLogCorrupt, err)
+	}
+	return ev.Key, nil
+}
+
 // Append 把事件原子追加到日志末尾（单次 write + fsync），返回其偏移。
 func (l *EventLog) Append(ev Event) (int64, error) {
 	if ev.ID == "" {

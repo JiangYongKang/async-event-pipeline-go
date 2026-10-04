@@ -82,6 +82,73 @@ Publish ──fsync──▶ events.log（单 writer 互斥，偏移单调）
     由于处理幂等，最终业务状态与首次顺序执行一致；死信按当前 Handler 语义
     重新判定。运行中调用 Replay 返回 `ErrPipelineRunning`。
 
+## 完成判定、等待语义与进度说明
+
+`WaitForOffset(n)` 只保证“水位到达调用时指定的偏移”，无法回答“**现在是不是
+真的全部处理完了**”：重启恢复时 dispatcher 可能还没追上日志、等待期间又有
+新事件追加、或还有事件停在重试退避里。为此提供两个新能力：
+
+### `WaitUntilIdle(ctx)` —— 等“真正处理完”再返回
+
+无论运行中还是停机后，调用后阻塞直到满足**全部**条件：
+
+1. 当前已 `Publish`（即已 fsync 入日志）的每条事件都到达**终态**
+   （成功处理或进入死信，重复投递副本也算）；
+2. 没有事件仍在执行 Handler/提交（`handling`）、退避等待重试（`retrying`）、
+   在键队列里排队等前序同键事件（`waiting`）；
+3. 没有事件“已发布但 dispatcher 尚未读到”（`unread`）——这正是重启恢复或
+   运行中追加新批次时最容易被漏掉的一类；
+4. 提交水位**连续**推进到日志末尾，中间没有任何缺口（`gap`）。
+
+判定不是只看一个水位数字，而是对日志中的**每个偏移逐一归类**，恒等式成立：
+
+```
+logEndOffset = succeeded + dead + handling + retrying + waiting + unread
+```
+
+等待期间新 `Publish` 的事件自动纳入等待范围（判定始终对照“调用期间不断增长
+的日志末尾”，而不是调用开始时的旧末尾），因此：
+
+- 重启后继续用、在旧历史上追加新事件：同一套机制覆盖新批次；
+- 运行过程中又追加一批：等到这批也终态才返回。
+
+返回后立刻查看状态，看到的就是完整结果——不存在“以为等到了、其实还有事件
+没消费”。停机状态下：若已全部终态立即返回 `nil`；若尚有未完成事件则返回
+`ErrPipelineNotRunning`（停机不可能自行产生进展，需先 `Start` 恢复消费）。
+
+### `Progress()` —— 可解释的进度说明
+
+返回一份快照（`Progress`），给出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `LogEndOffset` | 已发布事件总数（判定对照的“终点”） |
+| `DispatchedOffset` | dispatcher 已顺序读到的位置 |
+| `CommittedOffset` | 已连续终态的水位 |
+| `Succeeded` / `Dead` | 已成功 / 已死信的投递偏移数 |
+| `Handling` / `Retrying` / `Waiting` / `Unread` | 正在处理 / 等待重试 / 排队 / 尚未读到 |
+| `GapOffsets` | 水位前方仍无终态记录的偏移（缺口），直接说明“差在哪” |
+| `Keys` | 每个业务键的 `published / terminal / remaining` |
+| `Complete` / `Basis` | 是否完成，以及人读的判定依据 |
+
+`Progress` 实现了 `String()`，可直接多行打印。未等够时一眼能看到是卡在
+重试、排队还是 dispatcher 还没读到，而不用对着总数猜。
+
+## 对已有数据目录与状态的兼容
+
+- **快照文件格式不变**：仍是原来的 `state.snapshot.json`，旧目录可直接打开，
+  无需迁移。
+- **打开时自动对账（reconcile，自愈）**：幂等表按事件 ID 存储，而同一 ID 的
+  重复投递副本各占一个日志偏移；这类“重复偏移”的终态登记此前只存在于
+  运行期内存索引，重启后从幂等表重建时会丢失，在水位前方形成**伪空洞**
+  （水位虽已推进，但按偏移查询会误判该投递未终态，导致空闲判定永远不满足）。
+  现在 `Open` 会在消费者启动前用“日志 + 幂等表”无损重建偏移终态索引并重新
+  原子落盘：日志在、且该 ID 已有终态，就补回该偏移的终态引用。因此**复用旧
+  目录、追加新事件同样可靠**，新事件与历史事件享有一致的可靠投递、幂等与
+  同键顺序保证。
+- 投递语义（at-least-once / 业务效果 exactly-once / 同键顺序 / 死信三分类 /
+  回退拒绝）均不变；新能力是只读观测与更强的“处理完”判定，不改变处理路径。
+
 ## 本地验证
 
 要求 Go 1.25+，全程离线：
@@ -90,7 +157,10 @@ Publish ──fsync──▶ events.log（单 writer 互斥，偏移单调）
 # 1. 一键演示（正常/重复/重试/永久失败/非法负载，含进度与判定依据日志）
 go run ./cmd/demo -dir ./.demo-data -clean
 
-# 重启恢复（复用同一数据目录；重复事件不会二次生效）
+# 重启恢复 + 在旧进度上追加全新一批事件（复用同一数据目录）
+go run ./cmd/demo -dir ./.demo-data
+
+# 再次复用：重投相同 ID 演示跨重启幂等（计数不增长），且立即判定空闲
 go run ./cmd/demo -dir ./.demo-data
 
 # 停机后显式全量重放（最终状态应与重放前一致）
@@ -114,7 +184,20 @@ go test ./pipeline/ -v              # 查看逐条事件日志
 6. `TestReplayAndRejectRollback`：回退拒绝、越界拒绝、显式重放结果一致；
 7. `TestEventLogTornWriteTruncation` / `TestEventLogMidCorruptionRejected`：
    撕裂写截断与中间帧损坏报错；
-8. `TestHandlerPanicRecovered`：业务 panic 作为瞬态错误重试，不卡死键队列。
+8. `TestHandlerPanicRecovered`：业务 panic 作为瞬态错误重试，不卡死键队列；
+9. `TestWaitUntilIdleCoversAppendedBatch`：等待进行中并发追加新批次，
+   `WaitUntilIdle` 返回后全部终态、数字不再变化（无假阳性）；
+10. `TestProgressExplainsOutstandingWork`：进度说明如实区分
+    handling/retrying/waiting/unread、缺口偏移与每键剩余，未完成时
+    `Complete=false`；
+11. `TestResumeThenAppendReliable`：连续多轮复用同一目录，旧历史 + 新追加
+    批次（含跨重启同 ID 重复、同键衔接、重试事件）全部可靠处理到位；
+12. `TestStoppedIncompleteRejectsFalseIdle`：硬崩溃于重试中途后，停机态
+    `Progress` 把未完成事件计入 unread 并指出缺口，`WaitUntilIdle` 拒绝
+    假报完成；`Start` 恢复后收敛到完整；
+13. `TestIdleNoFalsePositiveUnderMixedLoad`：连续多轮、多键、高并发混跑
+    （发布未结束即开始等待），每轮进度恒等式成立、每键计数精确，
+    绝不“没处理完却报告完成”。
 
 测试日志中每条事件都打印 **事件标识（id/key/offset）、处理进度
 （committed 水位）与判定依据（verdict + basis）**，例如：
@@ -136,7 +219,12 @@ off, _ := p.Publish(pipeline.Event{
     ID: "order-123", Key: "tenant-7", Type: "inc", Payload: []byte("orders"),
 })
 
-_ = p.WaitForOffset(ctx, off+1)              // 等待该事件终态落盘
+_ = p.WaitForOffset(ctx, off+1)              // 只等这一条到终态
+// 或者：等“当前已发布的事件全部真正处理完”（含运行中追加的新批次）。
+if err := p.WaitUntilIdle(ctx); err != nil { // 停机且未完成 -> ErrPipelineNotRunning，先 Start
+	_ = err
+}
+fmt.Print(p.Progress().String())             // 成功/死信/处理中/重试/排队/未读、缺口、每键剩余
 snap := p.Snapshot()                         // committed 水位、幂等表、死信、业务状态
 _ = p.Drain(ctx)                             // 优雅停机：在途事件处理到终态
 _ = p.Close()

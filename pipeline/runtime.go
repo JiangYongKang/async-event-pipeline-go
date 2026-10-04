@@ -22,11 +22,14 @@ type keyQueue struct {
 }
 
 type counters struct {
-	processed atomic.Int64
-	dead      atomic.Int64
-	duplicate atomic.Int64
-	retry     atomic.Int64
-	inflight  atomic.Int64
+	processed  atomic.Int64
+	dead       atomic.Int64
+	duplicate  atomic.Int64
+	retry      atomic.Int64
+	inflight   atomic.Int64
+	handling   atomic.Int64 // 正在执行 Handler/提交（在途的子状态）
+	retrying   atomic.Int64 // 终态前退避等待重试（在途的子状态）
+	dispatched atomic.Int64 // dispatcher 已顺序读出的事件条数
 }
 
 // runtime 是并发消费运行时。
@@ -61,33 +64,49 @@ type runtime struct {
 	draining     bool
 	drainWake    chan struct{}
 
+	// dispatchFrom 本生命周期 dispatcher 的起始偏移（= Start 时的持久化水位）；
+	// 已读位置 = dispatchFrom + ctr.dispatched。
+	dispatchFrom int64
+	// phases 记录每个在途 job 当前处于“处理中”还是“退避重试中”，
+	// 供进度说明按偏移精确分类；与 queues 的读取均在 phaseMu/queues 锁下。
+	phaseMu sync.Mutex
+	phases  map[int64]string
+
 	notify chan struct{} // 水位推进信号（cap=1，丢失由调用方轮询兜底）
 	ctr    counters
 }
+
+const (
+	phaseHandling = "handling"
+	phaseRetrying = "retrying"
+)
 
 func startRuntime(ctx context.Context, cfg Config, el *EventLog, st *StateStore, h Handler) (*runtime, error) {
 	// ctx 仅表示“启动动作”的生命周期；运行生命周期由 Drain/Close 控制，
 	// 避免调用方的请求 context 取消后消费进程意外停止。
 	runCtx, runCancel := context.WithCancel(context.Background())
+	dispatchFrom := st.Committed()
 	rt := &runtime{
-		cfg:       cfg,
-		log:       el,
-		store:     st,
-		handler:   h,
-		logger:    cfg.Logger,
-		runCtx:    runCtx,
-		runCancel: runCancel,
-		queues:    make(map[string]*keyQueue),
-		permits:   make(chan struct{}, cfg.Parallelism),
-		wakeSched: make(chan struct{}, 1),
-		dispDone:  make(chan struct{}),
-		schedDone: make(chan struct{}),
-		drainWake: make(chan struct{}),
-		notify:    make(chan struct{}, 1),
+		cfg:          cfg,
+		log:          el,
+		store:        st,
+		handler:      h,
+		logger:       cfg.Logger,
+		runCtx:       runCtx,
+		runCancel:    runCancel,
+		queues:       make(map[string]*keyQueue),
+		permits:      make(chan struct{}, cfg.Parallelism),
+		wakeSched:    make(chan struct{}, 1),
+		dispDone:     make(chan struct{}),
+		schedDone:    make(chan struct{}),
+		drainWake:    make(chan struct{}),
+		notify:       make(chan struct{}, 1),
+		dispatchFrom: dispatchFrom,
+		phases:       make(map[int64]string),
 	}
 	streamCtx, streamCancel := context.WithCancel(runCtx)
 	rt.streamCancel = streamCancel
-	go rt.dispatch(streamCtx, st.Committed())
+	go rt.dispatch(streamCtx, dispatchFrom)
 	go rt.schedulerLoop(runCtx)
 	return rt, nil
 }
@@ -107,12 +126,14 @@ func (rt *runtime) dispatch(ctx context.Context, from int64) {
 
 // dispatchOne 处理 dispatcher 读到的一条事件：先做幂等快判，再按键入队。
 func (rt *runtime) dispatchOne(se StoredEvent) {
+	rt.ctr.dispatched.Add(1)
 	if rec, ok := rt.store.Lookup(se.Event.ID); ok {
 		// 事件 ID 已有终态（成功或死信）：业务效果绝不第二次生效。
 		rt.ctr.duplicate.Add(1)
 		if err := rt.store.MarkDuplicate(se.Offset, rec); err != nil {
 			rt.logger.Errorf("event=%s offset=%d key=%s duplicate mark failed: %v",
 				se.Event.ID, se.Offset, se.Event.Key, err)
+			rt.signalWatermark()
 			return
 		}
 		rt.logger.Infof("event=%s offset=%d key=%s verdict=duplicate progress=%d basis=idempotent-record(status=%s)",
@@ -133,6 +154,16 @@ func (rt *runtime) dispatchOne(se StoredEvent) {
 	rt.ctr.inflight.Add(1)
 	rt.mu.Unlock()
 	rt.pokeScheduler()
+	// 派发进度推进也是“空闲判定”需要观察的状态变化（dispatcher 追上日志）。
+	rt.signalWatermark()
+}
+
+// attemptObserver 观察单事件在“处理 / 退避重试”两个在途子状态间的切换，
+// 供进度说明区分“正在处理”与“等待重试”。离线路径传 nil。
+type attemptObserver interface {
+	handleStart()
+	backoffStart()
+	jobEnd()
 }
 
 // pokeScheduler 非阻塞唤醒调度器。
@@ -180,11 +211,19 @@ func (rt *runtime) schedule() {
 
 // runJob 在独立 goroutine 中把一个事件处理到终态（成功 / 死信）。
 func (rt *runtime) runJob(key string, ev StoredEvent) {
+	// 唤醒调度器必须是最后执行的收尾（LIFO：先于其它 defer 注册）：
+	// 只有在并行许可已释放之后再 poke，调度器下一次 schedule() 才可能成功
+	// 取得许可派发下一个键。若在释放许可前唤醒，调度器会因许可占满而直接
+	// 返回，而许可随后释放时却无人再唤醒——队首事件将永远得不到调度
+	// （jobsWG 不归零、Drain 永久等待）。
+	defer rt.pokeScheduler()
 	defer rt.jobsWG.Done()
 	defer rt.ctr.inflight.Add(-1)
 	defer func() { <-rt.permits }()
+	defer rt.signalWatermark()
 
-	res := processEvent(rt.runCtx, rt.cfg, rt.store, rt.handler, rt.logger, ev, &rt.ctr, rt.drainWake)
+	ob := &jobObserver{rt: rt, offset: ev.Offset}
+	res := processEvent(rt.runCtx, rt.cfg, rt.store, rt.handler, rt.logger, ev, &rt.ctr, rt.drainWake, ob)
 
 	rt.mu.Lock()
 	q := rt.queues[key]
@@ -199,7 +238,76 @@ func (rt *runtime) runJob(key string, ev StoredEvent) {
 	if res.advanced {
 		rt.signalWatermark()
 	}
-	rt.pokeScheduler()
+}
+
+// jobObserver 是单个 job 私有的在途子状态记账器：同一 job 的回调都在一个
+// goroutine 上发生，retrying 标志因而无需跨 goroutine 同步。
+type jobObserver struct {
+	rt       *runtime
+	offset   int64
+	retrying bool
+}
+
+func (o *jobObserver) handleStart() {
+	if o.retrying {
+		o.rt.ctr.retrying.Add(-1) // 退避结束，重新进入处理
+		o.retrying = false
+	}
+	o.rt.ctr.handling.Add(1)
+	o.rt.setPhase(o.offset, phaseHandling)
+}
+
+func (o *jobObserver) backoffStart() {
+	o.rt.ctr.handling.Add(-1)
+	o.rt.ctr.retrying.Add(1)
+	o.retrying = true
+	o.rt.setPhase(o.offset, phaseRetrying)
+}
+
+func (o *jobObserver) jobEnd() {
+	if o.retrying {
+		o.rt.ctr.retrying.Add(-1)
+	} else {
+		o.rt.ctr.handling.Add(-1)
+	}
+	o.rt.deletePhase(o.offset)
+}
+
+func (rt *runtime) setPhase(offset int64, phase string) {
+	rt.phaseMu.Lock()
+	rt.phases[offset] = phase
+	rt.phaseMu.Unlock()
+}
+
+func (rt *runtime) deletePhase(offset int64) {
+	rt.phaseMu.Lock()
+	delete(rt.phases, offset)
+	rt.phaseMu.Unlock()
+}
+
+// phaseSnapshot 返回“偏移 -> 在途子状态”的拷贝。
+func (rt *runtime) phaseSnapshot() map[int64]string {
+	rt.phaseMu.Lock()
+	defer rt.phaseMu.Unlock()
+	out := make(map[int64]string, len(rt.phases))
+	for k, v := range rt.phases {
+		out[k] = v
+	}
+	return out
+}
+
+// queuedOffsets 返回所有键队列中等待事件（含正在处理的队首）的偏移集合，
+// 供进度按偏移分类使用。
+func (rt *runtime) queuedOffsets() map[int64]struct{} {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make(map[int64]struct{})
+	for _, q := range rt.queues {
+		for _, se := range q.events {
+			out[se.Offset] = struct{}{}
+		}
+	}
+	return out
 }
 
 func (rt *runtime) signalWatermark() {
@@ -224,13 +332,19 @@ type processResult struct {
 // 失败、提交失败、上下文取消于终态之前）都直接丢弃克隆，事件保持未终态，
 // 因而不会留下半完成状态。
 func processEvent(ctx context.Context, cfg Config, st *StateStore, h Handler, lg Logger,
-	ev StoredEvent, ctr *counters, drainWake <-chan struct{}) processResult {
+	ev StoredEvent, ctr *counters, drainWake <-chan struct{}, obs attemptObserver) processResult {
 
+	if obs != nil {
+		defer obs.jobEnd()
+	}
 	var firstErrAt time.Time
 	attempts := 0
 
 	for {
 		attempts++
+		if obs != nil {
+			obs.handleStart()
+		}
 		clone, baseVersion := st.BusinessAndVersion()
 		err := safeHandle(ctx, h, ev, clone)
 		if err == nil {
@@ -294,6 +408,9 @@ func processEvent(ctx context.Context, cfg Config, st *StateStore, h Handler, lg
 		}
 		lg.Warnf("event=%s offset=%d key=%s verdict=retry attempt=%d/%d progress=%d basis=transient-error(%q); backoff then reprocess on fresh clone",
 			ev.Event.ID, ev.Offset, ev.Event.Key, attempts, cfg.MaxAttempts, st.Committed(), ee.Reason)
+		if obs != nil {
+			obs.backoffStart()
+		}
 		if !sleepBackoff(ctx, backoffDelay(cfg, attempts), drainWake) {
 			// 运行上下文在终态之前被取消：不判死信、不提交，重启后重新处理。
 			lg.Warnf("event=%s offset=%d key=%s verdict=deferred progress=%d basis=context-canceled-before-terminal",
@@ -520,7 +637,7 @@ func replayOffline(ctx context.Context, cfg Config, el *EventLog, st *StateStore
 				se.Event.ID, se.Offset, se.Event.Key, st.Committed())
 			continue
 		}
-		processEvent(ctx, cfg, st, h, cfg.Logger, se, &ctr, nil)
+		processEvent(ctx, cfg, st, h, cfg.Logger, se, &ctr, nil, nil)
 	}
 	cfg.Logger.Infof("replay complete progress=%d processed=%d dead=%d duplicates=%d basis=sequential-reprocessing",
 		st.Committed(), ctr.processed.Load(), ctr.dead.Load(), ctr.duplicate.Load())

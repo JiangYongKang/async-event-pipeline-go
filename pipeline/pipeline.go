@@ -105,6 +105,16 @@ func Open(cfg Config, handler Handler) (*Pipeline, error) {
 		_ = el.Close()
 		return nil, err
 	}
+	// 用日志对持久化进度对账自愈：补回重启丢失的“重复投递偏移终态登记”，
+	// 让水位与按偏移的终态索引重新自洽（必须在消费者启动前完成）。
+	if fixed, err := st.ReconcileWithLog(el); err != nil {
+		_ = el.Close()
+		_ = st.Close()
+		return nil, err
+	} else if fixed {
+		cfg.Logger.Infof("reconcile complete progress=%d logEnd=%d basis=rebuilt duplicate-offset terminal index from log+idempotency-table",
+			st.Committed(), el.NextOffset())
+	}
 	return &Pipeline{
 		cfg:     cfg,
 		log:     el,

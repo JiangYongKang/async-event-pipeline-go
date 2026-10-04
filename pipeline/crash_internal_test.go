@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"testing"
-	"time"
 )
 
 // 场景 7（包内）：在失败事件重试中途“硬重启”（不等终态）。重新打开管道后，
@@ -13,7 +12,7 @@ func TestCrashMidRetryThenRecover(t *testing.T) {
 	cfg := DefaultConfig(dir)
 	cfg.Logger = testLoggerInternal(t)
 	cfg.MaxAttempts = 1_000_000 // 第一次生命周期内永远重试，不会死信
-	cfg.RetryBackoff = time.Hour
+	cfg.RetryBackoff = hourBackoff
 
 	p1, err := Open(cfg, NewCountHandler().FailNTimes("e-bad", 1_000_000))
 	if err != nil {
@@ -28,14 +27,7 @@ func TestCrashMidRetryThenRecover(t *testing.T) {
 	if _, err := p1.Publish(Event{ID: "e-bad", Key: "k2", Type: "inc", Payload: []byte("c")}); err != nil {
 		t.Fatal(err)
 	}
-	wait := func(p *Pipeline, want int64) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if err := p.WaitForOffset(ctx, want); err != nil {
-			t.Fatal(err)
-		}
-	}
-	wait(p1, 1)
+	waitInternal(t, p1, 1)
 	before := p1.Snapshot().CommittedOffset
 	crashProcess(p1) // 模拟进程立即退出
 	t.Logf("ASSERT crash: committed before=%d, e-bad left mid-retry without terminal state", before)
@@ -51,7 +43,7 @@ func TestCrashMidRetryThenRecover(t *testing.T) {
 	if err := p2.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wait(p2, 2)
+	waitInternal(t, p2, 2)
 	if err := p2.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}

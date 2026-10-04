@@ -187,6 +187,51 @@ func (s *StateStore) load() error {
 	return nil
 }
 
+// ReconcileWithLog 用事件日志对持久化进度做一次对账并自愈，必须在
+// EventLog 完成崩溃恢复扫描（末尾撕裂帧已截断）之后、消费者启动之前调用。
+//
+// 要解决的问题：状态快照的幂等表按事件 ID 存储，而同一 ID 的重复投递
+// 副本各自占据不同的日志偏移；重复副本只在自己的偏移上登记“沿用首次
+// 终态”，该偏移登记仅存在于 byOffset。重启后 byOffset 从幂等表重建，
+// 这些重复偏移会丢失，在水位前方形成伪“空洞”（水位虽已推进，但按偏移
+// 查询时会误判该投递未终态，进而让空闲判定永远无法满足）。
+//
+// 日志 + 幂等表本身足以无损重建：对日志中每个偏移，若其事件 ID 已有
+// 终态记录而该偏移尚未登记，就补登该终态引用；随后让水位连续推进。
+// 重建结果（含自愈后的水位）重新原子落盘。返回是否发生了修复。
+func (s *StateStore) ReconcileWithLog(el *EventLog) (bool, error) {
+	end := el.NextOffset()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fixed := false
+	for off := int64(0); off < end; off++ {
+		if _, ok := s.byOffset[off]; ok {
+			continue
+		}
+		se, err := el.ReadAt(off)
+		if err != nil {
+			return false, err
+		}
+		rec, ok := s.records[se.Event.ID]
+		if !ok {
+			// 该偏移既无偏移登记也无幂等终态：尚未完成的正常事件（例如崩溃于
+			// 处理中途），跳过；跨键并行下它后面仍可能有可补登的重复偏移。
+			continue
+		}
+		s.byOffset[off] = rec
+		fixed = true
+	}
+	if s.advanceWatermarkLocked() {
+		fixed = true
+	}
+	if fixed {
+		if err := s.persistLocked(); err != nil {
+			return false, err
+		}
+	}
+	return fixed, nil
+}
+
 // Snapshot 返回当前状态的深拷贝。
 func (s *StateStore) Snapshot() StateSnapshot {
 	s.mu.Lock()
@@ -265,6 +310,33 @@ func (s *StateStore) DeadLetters() []DeadRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]DeadRecord(nil), s.dead...)
+}
+
+// TerminalAt 报告指定偏移的投递是否已到达终态（成功或死信）。
+// 重复投递副本在自己的偏移上登记后同样视为终态，其状态沿用首次终态。
+func (s *StateStore) TerminalAt(offset int64) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.byOffset[offset]
+	if !ok {
+		return "", false
+	}
+	return r.Status, true
+}
+
+// TerminalStatusCounts 按“已终态的投递偏移”统计成功与死信数量
+// （重复投递副本沿用其首次终态的归类）。两者之和即 byOffset 的条目数。
+func (s *StateStore) TerminalStatusCounts() (processed int64, dead int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.byOffset {
+		if r.Status == StatusDead {
+			dead++
+		} else {
+			processed++
+		}
+	}
+	return processed, dead
 }
 
 // CommitResult 描述一次终态提交的结果。
