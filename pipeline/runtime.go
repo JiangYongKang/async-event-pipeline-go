@@ -63,6 +63,14 @@ type runtime struct {
 
 	notify chan struct{} // 水位推进信号（cap=1，丢失由调用方轮询兜底）
 	ctr    counters
+
+	// readPos 是 dispatcher 已经读入管道（dispatchOne）的连续位置：
+	// [readPos, logEnd) 即“已发布但还没开始处理”的事件。dispatcher 单
+	// goroutine 顺序写，进度查询并发读，故用原子量。
+	readPos atomic.Int64
+	// jobs 追踪所有已派发但尚未终态的偏移所处阶段（queued/processing/retrying）。
+	jobsMu sync.Mutex
+	jobs   map[int64]*jobTrack
 }
 
 func startRuntime(ctx context.Context, cfg Config, el *EventLog, st *StateStore, h Handler) (*runtime, error) {
@@ -84,7 +92,9 @@ func startRuntime(ctx context.Context, cfg Config, el *EventLog, st *StateStore,
 		schedDone: make(chan struct{}),
 		drainWake: make(chan struct{}),
 		notify:    make(chan struct{}, 1),
+		jobs:      make(map[int64]*jobTrack),
 	}
+	rt.readPos.Store(st.Committed())
 	streamCtx, streamCancel := context.WithCancel(runCtx)
 	rt.streamCancel = streamCancel
 	go rt.dispatch(streamCtx, st.Committed())
@@ -107,6 +117,9 @@ func (rt *runtime) dispatch(ctx context.Context, from int64) {
 
 // dispatchOne 处理 dispatcher 读到的一条事件：先做幂等快判，再按键入队。
 func (rt *runtime) dispatchOne(se StoredEvent) {
+	// dispatcher 是唯一顺序读取者：连续推进已读位置（重复事件也已读入，
+	// 且在下面的同步提交后立即终态，不进入 jobs 追踪）。
+	rt.readPos.Store(se.Offset + 1)
 	if rec, ok := rt.store.Lookup(se.Event.ID); ok {
 		// 事件 ID 已有终态（成功或死信）：业务效果绝不第二次生效。
 		rt.ctr.duplicate.Add(1)
@@ -132,6 +145,7 @@ func (rt *runtime) dispatchOne(se StoredEvent) {
 	rt.jobsWG.Add(1)
 	rt.ctr.inflight.Add(1)
 	rt.mu.Unlock()
+	rt.trackAdd(se.Offset, se.Event.ID, se.Event.Key)
 	rt.pokeScheduler()
 }
 
@@ -173,6 +187,7 @@ func (rt *runtime) schedule() {
 		}
 		ev := q.events[0]
 		q.busy = true
+		rt.trackPhase(ev.Offset, phaseProcessing, 0, "", time.Time{})
 		go rt.runJob(key, ev)
 	}
 	rt.mu.Unlock()
@@ -183,8 +198,10 @@ func (rt *runtime) runJob(key string, ev StoredEvent) {
 	defer rt.jobsWG.Done()
 	defer rt.ctr.inflight.Add(-1)
 	defer func() { <-rt.permits }()
+	defer rt.trackRemove(ev.Offset)
 
-	res := processEvent(rt.runCtx, rt.cfg, rt.store, rt.handler, rt.logger, ev, &rt.ctr, rt.drainWake)
+	tracker := &jobHook{rt: rt, offset: ev.Offset}
+	res := processEvent(rt.runCtx, rt.cfg, rt.store, rt.handler, rt.logger, ev, &rt.ctr, rt.drainWake, tracker)
 
 	rt.mu.Lock()
 	q := rt.queues[key]
@@ -224,7 +241,7 @@ type processResult struct {
 // 失败、提交失败、上下文取消于终态之前）都直接丢弃克隆，事件保持未终态，
 // 因而不会留下半完成状态。
 func processEvent(ctx context.Context, cfg Config, st *StateStore, h Handler, lg Logger,
-	ev StoredEvent, ctr *counters, drainWake <-chan struct{}) processResult {
+	ev StoredEvent, ctr *counters, drainWake <-chan struct{}, tracker jobTracker) processResult {
 
 	var firstErrAt time.Time
 	attempts := 0
@@ -292,13 +309,23 @@ func processEvent(ctx context.Context, cfg Config, st *StateStore, h Handler, lg
 		if ctr != nil {
 			ctr.retry.Add(1)
 		}
+		backoff := backoffDelay(cfg, attempts)
+		if tracker != nil {
+			tracker.onRetry(attempts, ee.Reason, time.Now().Add(backoff))
+		}
 		lg.Warnf("event=%s offset=%d key=%s verdict=retry attempt=%d/%d progress=%d basis=transient-error(%q); backoff then reprocess on fresh clone",
 			ev.Event.ID, ev.Offset, ev.Event.Key, attempts, cfg.MaxAttempts, st.Committed(), ee.Reason)
-		if !sleepBackoff(ctx, backoffDelay(cfg, attempts), drainWake) {
+		if !sleepBackoff(ctx, backoff, drainWake) {
+			if tracker != nil {
+				tracker.onAbort(attempts, "context-canceled-before-terminal")
+			}
 			// 运行上下文在终态之前被取消：不判死信、不提交，重启后重新处理。
 			lg.Warnf("event=%s offset=%d key=%s verdict=deferred progress=%d basis=context-canceled-before-terminal",
 				ev.Event.ID, ev.Offset, ev.Event.Key, st.Committed())
 			return processResult{attempts: attempts}
+		}
+		if tracker != nil {
+			tracker.onProcess(attempts + 1)
 		}
 	}
 }
@@ -399,7 +426,80 @@ func (rt *runtime) processedTotal() int64 { return rt.ctr.processed.Load() }
 func (rt *runtime) duplicateTotal() int64 { return rt.ctr.duplicate.Load() }
 func (rt *runtime) retryTotal() int64     { return rt.ctr.retry.Load() }
 
-// drain 停止派发并等待所有在途事件到达终态并落盘。
+// ---- 未终态事件的运行期追踪（仅用于进度与完成判定）----
+
+// jobHook 把 processEvent 的阶段变化写入 runtime.jobs。
+type jobHook struct {
+	rt     *runtime
+	offset int64
+}
+
+func (h *jobHook) onRetry(attempt int, reason string, waitUntil time.Time) {
+	h.rt.trackPhase(h.offset, phaseRetrying, attempt, reason, waitUntil)
+}
+
+func (h *jobHook) onProcess(nextAttempt int) {
+	h.rt.trackPhase(h.offset, phaseProcessing, nextAttempt, "", time.Time{})
+}
+
+func (h *jobHook) onAbort(attempt int, reason string) {
+	h.rt.trackPhase(h.offset, phaseQueued, attempt, reason, time.Time{})
+}
+
+func (rt *runtime) trackAdd(offset int64, eventID, key string) {
+	rt.jobsMu.Lock()
+	rt.jobs[offset] = &jobTrack{offset: offset, eventID: eventID, key: key, phase: phaseQueued}
+	rt.jobsMu.Unlock()
+}
+
+func (rt *runtime) trackPhase(offset int64, phase jobPhase, attempt int, reason string, waitUntil time.Time) {
+	rt.jobsMu.Lock()
+	if jt := rt.jobs[offset]; jt != nil {
+		jt.phase = phase
+		if attempt > 0 {
+			jt.attempts = attempt
+		}
+		if reason != "" {
+			jt.lastError = reason
+		}
+		if !waitUntil.IsZero() {
+			jt.waitUntil = waitUntil
+		} else if phase != phaseRetrying {
+			jt.waitUntil = time.Time{}
+		}
+	}
+	rt.jobsMu.Unlock()
+}
+
+func (rt *runtime) trackRemove(offset int64) {
+	rt.jobsMu.Lock()
+	delete(rt.jobs, offset)
+	rt.jobsMu.Unlock()
+	// 终态提交发生在 remove 之前，这里再发一次信号，保证等待者能观察到
+	// “水位到达且追踪表清空”的最终静止状态（信号丢失有轮询兜底）。
+	rt.signalWatermark()
+}
+
+// snapshotJobs 返回当前未终态追踪记录的拷贝。
+func (rt *runtime) snapshotJobs() map[int64]*jobTrack {
+	rt.jobsMu.Lock()
+	defer rt.jobsMu.Unlock()
+	out := make(map[int64]*jobTrack, len(rt.jobs))
+	for off, jt := range rt.jobs {
+		cp := *jt
+		out[off] = &cp
+	}
+	return out
+}
+
+func (rt *runtime) dispatchedUpTo() int64 { return rt.readPos.Load() }
+
+// drain 停止派发并等待所有“调用时已发布”的事件到达终态并落盘。
+//
+// 先捕获日志末尾 target：target 之前的事件即使此刻还没被 dispatcher 读到，
+// 也必须等到终态，杜绝“已 fsync 但尚未读入的事件在停机时被漏掉”。
+// 随后中断重试退避、停止读取新事件，并等待在途作业清空；水位连续推进到
+// target 后才返回。Drain 之后追加的事件不在本次停机保证范围内（流已停止）。
 func (rt *runtime) drain(ctx context.Context) error {
 	rt.mu.Lock()
 	if rt.draining {
@@ -407,26 +507,53 @@ func (rt *runtime) drain(ctx context.Context) error {
 		return nil
 	}
 	rt.draining = true
+	target := rt.log.NextOffset()
 	rt.mu.Unlock()
 
 	close(rt.drainWake) // 中断所有重试退避，让在途事件立即做最后一轮尝试
-	rt.streamCancel()   // 停止读取新事件
-	<-rt.dispDone
-
-	done := make(chan struct{})
-	go func() {
-		rt.jobsWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		rt.runCancel()
-		rt.logger.Infof("drain complete progress=%d basis=all-inflight-reached-terminal-state",
-			rt.store.Committed())
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	// 先等在途与未读事件全部到终态（此期间仍允许 dispatcher 把已发布事件读入），
+	// 再停止读流；避免“先取消流、事件已在日志但未读入”造成的静默遗漏。
+	if err := rt.waitIdleUntil(ctx, target); err != nil {
+		rt.streamCancel()
+		return err
 	}
+	rt.streamCancel()
+	<-rt.dispDone
+	rt.runCancel()
+	rt.logger.Infof("drain complete progress=%d basis=all-published-through-offset-%d-reached-terminal-state",
+		rt.store.Committed(), target)
+	return nil
+}
+
+// waitIdleUntil 等待水位连续覆盖 target，并且追踪表中没有任何未终态事件。
+// 水位条件（由 store 的提交逻辑保证）本身已是充分条件；追踪表为空是额外
+// 校验，确保进度判定与等待判定用的是同一套事实，任何记账缺口都会暴露为
+// 永不满足而非假阳性完成。
+func (rt *runtime) waitIdleUntil(ctx context.Context, target int64) error {
+	if target < 0 {
+		return ErrOffsetBeforeEarliest
+	}
+	ticker := time.NewTicker(rt.cfg.PollInterval)
+	defer ticker.Stop()
+	for {
+		if rt.store.AllTerminalUntil(target) && len(rt.snapshotJobs()) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-rt.notify:
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitIdle 以“调用时刻的日志末尾”为目标等待空闲。目标在进入循环前捕获，
+// 之后并发追加的事件不纳入本次等待——这正是“当前已经发布的事件全部处理完”
+// 的语义边界；需要包含后续追加，可在追加后再次调用。
+func (rt *runtime) waitIdle(ctx context.Context) error {
+	target := rt.log.NextOffset()
+	return rt.waitIdleUntil(ctx, target)
 }
 
 // waitOffset 阻塞直到提交水位 >= offset；结合信号与轮询兜底。
@@ -520,7 +647,7 @@ func replayOffline(ctx context.Context, cfg Config, el *EventLog, st *StateStore
 				se.Event.ID, se.Offset, se.Event.Key, st.Committed())
 			continue
 		}
-		processEvent(ctx, cfg, st, h, cfg.Logger, se, &ctr, nil)
+		processEvent(ctx, cfg, st, h, cfg.Logger, se, &ctr, nil, nil)
 	}
 	cfg.Logger.Infof("replay complete progress=%d processed=%d dead=%d duplicates=%d basis=sequential-reprocessing",
 		st.Committed(), ctr.processed.Load(), ctr.dead.Load(), ctr.duplicate.Load())

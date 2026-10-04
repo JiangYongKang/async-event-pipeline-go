@@ -75,6 +75,12 @@ type stateEnvelope struct {
 	Business        json.RawMessage           `json:"business"`
 	StateVersion    uint64                    `json:"state_version"`
 	UpdatedAt       time.Time                 `json:"updated_at"`
+	// OffsetAliases 记录“重复投递”占用的偏移 -> 其首次终态记录的事件 ID。
+	// 幂等表 records 只保存每个事件 ID 的一条主记录，因此重复副本的偏移
+	// 必须单独持久化，否则重启后按偏移的终态索引会缺项（只能被水位掩盖），
+	// 进度枚举与完成判定就会与真实情况不符。旧快照缺省该字段时，Open 会
+	// 依据事件日志重新对账补齐，因此与既有数据目录完全兼容。
+	OffsetAliases map[int64]string `json:"offset_aliases,omitempty"`
 }
 
 // StateStore 是消费状态 + 业务效果的原子持久化存储（单文件快照）。
@@ -94,6 +100,7 @@ type StateStore struct {
 	committed int64
 	records   map[string]*ProcessRecord // 事件ID -> 终态记录（幂等表）
 	byOffset  map[int64]*ProcessRecord  // 偏移 -> 终态记录（水位连续推进用）
+	aliases   map[int64]string          // 重复投递偏移 -> 主记录事件ID（持久化）
 	dead      []DeadRecord
 	business  BusinessState
 	version   uint64
@@ -113,6 +120,7 @@ func OpenStateStore(path string, newBusiness func() BusinessState) (*StateStore,
 		path:        path,
 		records:     make(map[string]*ProcessRecord),
 		byOffset:    make(map[int64]*ProcessRecord),
+		aliases:     make(map[int64]string),
 		newBusiness: newBusiness,
 	}
 	if dir := filepath.Dir(path); dir != "" {
@@ -157,7 +165,11 @@ func (s *StateStore) load() error {
 	}
 	s.committed = env.CommittedOffset
 	s.records = env.Records
-	s.byOffset = make(map[int64]*ProcessRecord, len(s.records))
+	s.aliases = env.OffsetAliases
+	if s.aliases == nil {
+		s.aliases = make(map[int64]string)
+	}
+	s.byOffset = make(map[int64]*ProcessRecord, len(s.records)+len(s.aliases))
 	for id, r := range s.records {
 		// 不同业务键并行提交时，offset >= committed 的终态记录是正常状态
 		// （只等前方空洞补齐后水位即可连续跨过它）；同一 offset 不得冲突。
@@ -166,6 +178,19 @@ func (s *StateStore) load() error {
 				ErrLogCorrupt, r.Offset, cur.EventID, id)
 		}
 		s.byOffset[r.Offset] = s.records[id]
+	}
+	// 重建重复投递偏移的索引（指向其首次终态主记录）；主记录缺失视为损坏。
+	for off, id := range s.aliases {
+		rec, ok := s.records[id]
+		if !ok {
+			return fmt.Errorf("%w: duplicate alias at offset=%d points to missing record %q",
+				ErrLogCorrupt, off, id)
+		}
+		if cur, dup := s.byOffset[off]; dup && cur.EventID != id {
+			return fmt.Errorf("%w: two records at offset=%d: %q vs %q",
+				ErrLogCorrupt, off, cur.EventID, id)
+		}
+		s.byOffset[off] = rec
 	}
 	// 恢复后从持久化水位起连续推进：若崩溃前恰好已写记录但水位推进未单独
 	// 落盘（水位推进总是与记录同一快照，此循环通常为空），此处兜底收敛。
@@ -267,6 +292,19 @@ func (s *StateStore) DeadLetters() []DeadRecord {
 	return append([]DeadRecord(nil), s.dead...)
 }
 
+// TerminalOffsets 返回 offset -> 终态记录映射的拷贝。包含成功与死信两类
+// 终态（重复投递的偏移指向其对应已有终态记录）。进度枚举据此对每个偏移
+// 给出权威的终态结论，而不是仅靠水位猜测。
+func (s *StateStore) TerminalOffsets() map[int64]ProcessRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int64]ProcessRecord, len(s.byOffset))
+	for off, r := range s.byOffset {
+		out[off] = *r
+	}
+	return out
+}
+
 // CommitResult 描述一次终态提交的结果。
 type CommitResult struct {
 	Record       *ProcessRecord
@@ -293,7 +331,7 @@ func (s *StateStore) CommitProcessed(rec ProcessRecord, business BusinessState, 
 		// 但本次投递在自己的 offset 上仍要登记，供连续水位跨过它。
 		advanced := false
 		if _, existsOffset := s.byOffset[rec.Offset]; !existsOffset {
-			s.byOffset[rec.Offset] = existing
+			s.registerAliasLocked(rec.Offset, rec.EventID, existing)
 			advanced = s.advanceWatermarkLocked()
 			if err := s.persistLocked(); err != nil {
 				return CommitResult{}, err
@@ -345,7 +383,7 @@ func (s *StateStore) CommitDead(dead DeadRecord, business BusinessState, baseVer
 		// 并发重复：沿用已有终态，不重复计入死信列表；本 offset 仍需登记。
 		advanced := false
 		if _, existsOffset := s.byOffset[dead.Offset]; !existsOffset {
-			s.byOffset[dead.Offset] = existing
+			s.registerAliasLocked(dead.Offset, dead.EventID, existing)
 			advanced = s.advanceWatermarkLocked()
 			if err := s.persistLocked(); err != nil {
 				return CommitResult{}, err
@@ -403,7 +441,7 @@ func (s *StateStore) MarkDuplicate(offset int64, existing *ProcessRecord) error 
 	defer s.mu.Unlock()
 	if cur, ok := s.byOffset[offset]; !ok {
 		// 登记一条指向既有终态记录的引用；同一事件 ID 的效果已在原记录中。
-		s.byOffset[offset] = existing
+		s.registerAliasLocked(offset, existing.EventID, existing)
 		s.advanceWatermarkLocked()
 		return s.persistLocked()
 	} else if cur.Offset != offset {
@@ -411,6 +449,64 @@ func (s *StateStore) MarkDuplicate(offset int64, existing *ProcessRecord) error 
 	}
 	s.advanceWatermarkLocked()
 	return nil
+}
+
+// registerAliasLocked 把重复投递占用的 offset 登记为指向其首次终态主记录
+// 的别名，同时写入内存索引与可持久化的别名表（调用方持锁）。
+func (s *StateStore) registerAliasLocked(offset int64, eventID string, existing *ProcessRecord) {
+	s.byOffset[offset] = existing
+	s.aliases[offset] = eventID
+}
+
+// ReconcileOffsets 依据事件日志对按偏移的终态索引做一次对账：
+//
+// 对 [0, end) 中每个已在幂等表里出现过（事件 ID 已有终态）、但偏移索引缺项
+// 的位置补登别名。这是为兼容旧版数据目录而设——旧快照不持久化重复投递的
+// 偏移别名，仅靠水位掩盖；对账后进度枚举与完成判定重新对每个偏移成立。
+//
+// readEvent 由 Pipeline 注入（offset -> 事件 ID），避免 StateStore 依赖日志。
+// 若发现日志条目与幂等表完全无法对应（理论上不会发生：committed<=end），
+// 返回 ErrLogCorrupt。
+func (s *StateStore) ReconcileOffsets(end int64, readEvent func(offset int64) (eventID string, err error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repaired := 0
+	for off := int64(0); off < end; off++ {
+		if _, ok := s.byOffset[off]; ok {
+			continue
+		}
+		id, err := readEvent(off)
+		if err != nil {
+			return err
+		}
+		rec, ok := s.records[id]
+		if !ok {
+			// 索引缺项且该 ID 尚无终态：正常的未处理事件，不属于对账范围。
+			continue
+		}
+		s.registerAliasLocked(off, id, rec)
+		repaired++
+	}
+	if repaired > 0 {
+		s.advanceWatermarkLocked()
+		if err := s.persistLocked(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AllTerminalUntil 是“完成”的权威谓词：[0, end) 的每一个偏移都已有终态记录。
+// 它不依赖水位之外的任何缓存，也不需要遍历——主记录与别名合计每个终态偏移
+// 恰好一条。水位连续推进规则保证 AllTerminalUntil(end) 蕴含 committed>=end；
+// 同时校验两个条件，使任何记账不一致都会表现为“未完成”而不是假阳性。
+func (s *StateStore) AllTerminalUntil(end int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if end < 0 || s.committed < end {
+		return false
+	}
+	return len(s.byOffset) >= int(end)
 }
 
 // advanceWatermarkLocked 从当前水位起，只要对应 offset 已有终态记录就
@@ -470,6 +566,7 @@ func (s *StateStore) ResetForReplay(offset int64) error {
 	s.committed = 0
 	s.records = make(map[string]*ProcessRecord)
 	s.byOffset = make(map[int64]*ProcessRecord)
+	s.aliases = make(map[int64]string)
 	s.dead = nil
 	s.business = s.newBusiness()
 	s.version++
@@ -493,6 +590,7 @@ func (s *StateStore) persistLocked() error {
 		Business:        bizRaw,
 		StateVersion:    s.version,
 		UpdatedAt:       time.Now(),
+		OffsetAliases:   s.aliases,
 	}
 	data, err := json.MarshalIndent(&env, "", "  ")
 	if err != nil {

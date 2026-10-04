@@ -105,12 +105,29 @@ func Open(cfg Config, handler Handler) (*Pipeline, error) {
 		_ = el.Close()
 		return nil, err
 	}
+	// 依据事件日志对账按偏移的终态索引：主要为修复旧版快照未持久化的
+	// 重复投递偏移别名，使复用既有数据目录后进度/完成判定逐偏移成立。
+	if err := reconcileOnOpen(el, st); err != nil {
+		_ = el.Close()
+		return nil, err
+	}
 	return &Pipeline{
 		cfg:     cfg,
 		log:     el,
 		store:   st,
 		handler: handler,
 	}, nil
+}
+
+// reconcileOnOpen 用日志中每个偏移的事件 ID 补齐状态存储的偏移终态索引。
+func reconcileOnOpen(el *EventLog, st *StateStore) error {
+	return st.ReconcileOffsets(el.NextOffset(), func(off int64) (string, error) {
+		se, err := el.ReadAt(off)
+		if err != nil {
+			return "", err
+		}
+		return se.Event.ID, nil
+	})
 }
 
 // Publish 持久化一条事件（可靠投递入口），返回其偏移。
